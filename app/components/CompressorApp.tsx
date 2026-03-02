@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useRef, DragEvent, ChangeEvent } from 'react'
+import { useState, useRef, useEffect, useCallback, DragEvent, ChangeEvent } from 'react'
 
 type Tab = 'image' | 'pdf'
 type ImageFormat = 'keep' | 'jpeg' | 'png' | 'webp'
@@ -23,6 +23,17 @@ function formatBytes(bytes: number): string {
 
 function getReduction(original: number, compressed: number): number {
   return Math.round((1 - compressed / original) * 100)
+}
+
+function getCanvasMimeType(format: ImageFormat, originalType: string): string {
+  if (format === 'keep') {
+    if (originalType === 'image/png') return 'image/png'
+    if (originalType === 'image/webp') return 'image/webp'
+    return 'image/jpeg'
+  }
+  if (format === 'png') return 'image/png'
+  if (format === 'webp') return 'image/webp'
+  return 'image/jpeg'
 }
 
 const IMAGE_ACCEPT = '.jpg,.jpeg,.png,.webp,.gif,.bmp'
@@ -89,12 +100,109 @@ export default function CompressorApp() {
   const [isCompressing, setIsCompressing] = useState(false)
   const [result, setResult] = useState<FileResult | null>(null)
   const [error, setError] = useState<string | null>(null)
-  const inputRef = useRef<HTMLInputElement>(null)
 
+  // Preview states
+  const [originalPreviewUrl, setOriginalPreviewUrl] = useState<string | null>(null)
+  const [previewUrl, setPreviewUrl] = useState<string | null>(null)
+  const [previewSize, setPreviewSize] = useState<number | null>(null)
+  const [isPreviewLoading, setIsPreviewLoading] = useState(false)
+
+  // Refs
+  const inputRef = useRef<HTMLInputElement>(null)
+  const imgElementRef = useRef<HTMLImageElement | null>(null)
+  const previewBlobUrlRef = useRef<string | null>(null)
+
+  // --- Canvas-based preview generation ---
+  const generatePreview = useCallback(
+    (img: HTMLImageElement, q: number, fmt: ImageFormat, fileType: string) => {
+      const canvas = document.createElement('canvas')
+      canvas.width = img.naturalWidth
+      canvas.height = img.naturalHeight
+      const ctx = canvas.getContext('2d')
+      if (!ctx) return
+
+      ctx.drawImage(img, 0, 0)
+
+      const mimeType = getCanvasMimeType(fmt, fileType)
+      // PNG is lossless — quality param is ignored by canvas for PNG
+      const qualityVal = mimeType === 'image/png' ? undefined : q / 100
+
+      canvas.toBlob(
+        (blob) => {
+          if (!blob) return
+          // Revoke old preview URL
+          if (previewBlobUrlRef.current) URL.revokeObjectURL(previewBlobUrlRef.current)
+          const url = URL.createObjectURL(blob)
+          previewBlobUrlRef.current = url
+          setPreviewUrl(url)
+          setPreviewSize(blob.size)
+          setIsPreviewLoading(false)
+        },
+        mimeType,
+        qualityVal
+      )
+    },
+    []
+  )
+
+  // Effect: load image into canvas when file changes
+  useEffect(() => {
+    // Cleanup previous
+    if (previewBlobUrlRef.current) {
+      URL.revokeObjectURL(previewBlobUrlRef.current)
+      previewBlobUrlRef.current = null
+    }
+    imgElementRef.current = null
+    setOriginalPreviewUrl(null)
+    setPreviewUrl(null)
+    setPreviewSize(null)
+    setIsPreviewLoading(false)
+
+    if (!file || tab !== 'image') return
+
+    const objectUrl = URL.createObjectURL(file)
+    setOriginalPreviewUrl(objectUrl)
+    setIsPreviewLoading(true)
+
+    const img = new Image()
+    img.onload = () => {
+      imgElementRef.current = img
+      generatePreview(img, quality, imageFormat, file.type)
+    }
+    img.onerror = () => setIsPreviewLoading(false)
+    img.src = objectUrl
+
+    return () => URL.revokeObjectURL(objectUrl)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [file, tab])
+
+  // Effect: regenerate preview when quality or format changes (debounced 80ms)
+  useEffect(() => {
+    if (!imgElementRef.current || !file || tab !== 'image') return
+
+    setIsPreviewLoading(true)
+    const timer = setTimeout(() => {
+      if (imgElementRef.current && file) {
+        generatePreview(imgElementRef.current, quality, imageFormat, file.type)
+      }
+    }, 80)
+
+    return () => clearTimeout(timer)
+  }, [quality, imageFormat, tab, file, generatePreview])
+
+  // --- Helpers ---
   const resetState = () => {
+    if (previewBlobUrlRef.current) {
+      URL.revokeObjectURL(previewBlobUrlRef.current)
+      previewBlobUrlRef.current = null
+    }
+    imgElementRef.current = null
     setFile(null)
     setResult(null)
     setError(null)
+    setOriginalPreviewUrl(null)
+    setPreviewUrl(null)
+    setPreviewSize(null)
   }
 
   const handleTabChange = (newTab: Tab) => {
@@ -215,10 +323,13 @@ export default function CompressorApp() {
   }
 
   const reduction = result ? getReduction(result.originalSize, result.compressedSize) : 0
+  const previewReduction = file && previewSize ? getReduction(file.size, previewSize) : 0
+  const isPng = imageFormat === 'png' || (imageFormat === 'keep' && file?.type === 'image/png')
   const qualityLabel = quality >= 80 ? 'High Quality' : quality >= 50 ? 'Balanced' : 'Max Compression'
 
   return (
     <div className="min-h-screen bg-[#09090b] text-zinc-100 selection:bg-violet-600/30">
+
       {/* ---- Header ---- */}
       <header className="sticky top-0 z-50 border-b border-zinc-800/60 bg-[#09090b]/80 backdrop-blur-md">
         <div className="mx-auto max-w-3xl px-5 h-16 flex items-center gap-3">
@@ -231,7 +342,7 @@ export default function CompressorApp() {
             <h1 className="text-[15px] font-bold text-zinc-100 leading-none">FileCompressor</h1>
             <p className="text-[11px] text-zinc-500 mt-0.5 leading-none">Images & PDFs</p>
           </div>
-          <div className="ml-auto flex items-center gap-2">
+          <div className="ml-auto">
             <span className="text-[11px] font-medium text-zinc-500 bg-zinc-900 border border-zinc-800 px-2.5 py-1 rounded-full">
               Free & Local
             </span>
@@ -240,6 +351,7 @@ export default function CompressorApp() {
       </header>
 
       <main className="mx-auto max-w-3xl px-5 py-12 pb-20">
+
         {/* ---- Hero ---- */}
         <div className="text-center mb-12">
           <div className="inline-flex items-center gap-2 bg-violet-950/50 border border-violet-800/40 rounded-full px-4 py-1.5 text-xs text-violet-300 font-medium mb-5">
@@ -289,7 +401,9 @@ export default function CompressorApp() {
           onDragLeave={handleDragLeave}
           onDrop={handleDrop}
           onClick={() => inputRef.current?.click()}
-          className={`relative border-2 border-dashed rounded-3xl p-14 text-center cursor-pointer transition-all duration-200 group mb-5 ${
+          className={`relative border-2 border-dashed rounded-3xl text-center cursor-pointer transition-all duration-200 group mb-5 ${
+            file ? 'py-5 px-8' : 'p-14'
+          } ${
             isDragging
               ? 'border-violet-500 bg-violet-950/30 scale-[1.01]'
               : file
@@ -305,26 +419,26 @@ export default function CompressorApp() {
             onChange={handleInputChange}
           />
 
-          {/* Glow effect when dragging */}
           {isDragging && (
             <div className="absolute inset-0 rounded-3xl bg-violet-500/5 pointer-events-none" />
           )}
 
           {file ? (
-            <div className="flex flex-col items-center gap-4">
-              <div className={`w-20 h-20 rounded-2xl flex items-center justify-center border ${
+            /* Compact file info when selected */
+            <div className="flex items-center gap-4">
+              <div className={`w-12 h-12 rounded-xl flex-shrink-0 flex items-center justify-center border ${
                 tab === 'image'
                   ? 'bg-blue-950/60 border-blue-800/50 text-blue-400'
                   : 'bg-red-950/60 border-red-800/50 text-red-400'
               }`}>
-                {tab === 'image' ? <ImageIcon size={9} /> : <PdfIcon size={9} />}
+                {tab === 'image' ? <ImageIcon size={6} /> : <PdfIcon size={6} />}
               </div>
-              <div>
-                <p className="text-zinc-200 font-semibold text-lg">{file.name}</p>
-                <p className="text-zinc-500 text-sm mt-1">{formatBytes(file.size)}</p>
+              <div className="text-left flex-1 min-w-0">
+                <p className="text-zinc-200 font-semibold truncate">{file.name}</p>
+                <p className="text-zinc-500 text-sm">{formatBytes(file.size)}</p>
               </div>
-              <p className="text-zinc-600 text-xs border border-zinc-800 rounded-full px-3 py-1 group-hover:border-zinc-700 transition-colors">
-                Click or drop to change file
+              <p className="text-zinc-600 text-xs border border-zinc-800 rounded-full px-3 py-1.5 group-hover:border-zinc-700 transition-colors flex-shrink-0">
+                Change file
               </p>
             </div>
           ) : (
@@ -341,19 +455,11 @@ export default function CompressorApp() {
               <div className="flex flex-wrap justify-center gap-2">
                 {tab === 'image'
                   ? ['JPG', 'PNG', 'WebP', 'GIF', 'BMP'].map((f) => (
-                      <span key={f} className="text-[11px] font-medium text-zinc-600 bg-zinc-800/80 border border-zinc-700/50 rounded-full px-2.5 py-0.5">
-                        {f}
-                      </span>
+                      <span key={f} className="text-[11px] font-medium text-zinc-600 bg-zinc-800/80 border border-zinc-700/50 rounded-full px-2.5 py-0.5">{f}</span>
                     ))
-                  : (
-                    <span className="text-[11px] font-medium text-zinc-600 bg-zinc-800/80 border border-zinc-700/50 rounded-full px-2.5 py-0.5">
-                      PDF
-                    </span>
-                  )
+                  : <span className="text-[11px] font-medium text-zinc-600 bg-zinc-800/80 border border-zinc-700/50 rounded-full px-2.5 py-0.5">PDF</span>
                 }
-                <span className="text-[11px] font-medium text-zinc-600 bg-zinc-800/80 border border-zinc-700/50 rounded-full px-2.5 py-0.5">
-                  Max 4MB
-                </span>
+                <span className="text-[11px] font-medium text-zinc-600 bg-zinc-800/80 border border-zinc-700/50 rounded-full px-2.5 py-0.5">Max 4MB</span>
               </div>
             </div>
           )}
@@ -369,6 +475,115 @@ export default function CompressorApp() {
           </div>
         )}
 
+        {/* ================================================================ */}
+        {/* ---- LIVE IMAGE PREVIEW (side-by-side) ---- */}
+        {/* ================================================================ */}
+        {file && tab === 'image' && originalPreviewUrl && (
+          <div className="mb-5">
+            <div className="grid grid-cols-2 gap-3">
+
+              {/* Original */}
+              <div className="bg-zinc-900 border border-zinc-800 rounded-2xl overflow-hidden">
+                <div className="px-4 py-2.5 border-b border-zinc-800 flex items-center justify-between">
+                  <span className="text-[11px] font-bold text-zinc-500 uppercase tracking-widest">Original</span>
+                  <span className="text-xs font-semibold text-zinc-400">{formatBytes(file.size)}</span>
+                </div>
+                <div
+                  className="h-52 sm:h-64 flex items-center justify-center p-3"
+                  style={{ background: 'repeating-conic-gradient(#18181b 0% 25%, #111113 0% 50%) 0 0 / 16px 16px' }}
+                >
+                  {/* eslint-disable-next-line @next/next/no-img-element */}
+                  <img
+                    src={originalPreviewUrl}
+                    alt="Original"
+                    className="max-h-full max-w-full object-contain rounded drop-shadow-lg"
+                  />
+                </div>
+              </div>
+
+              {/* Preview (live) */}
+              <div className="bg-zinc-900 border border-zinc-800 rounded-2xl overflow-hidden">
+                <div className="px-4 py-2.5 border-b border-zinc-800 flex items-center justify-between">
+                  <span className="text-[11px] font-bold text-zinc-500 uppercase tracking-widest">Preview</span>
+                  {previewSize !== null && !isPreviewLoading && (
+                    <div className="flex items-center gap-1.5">
+                      <span className={`text-xs font-semibold ${previewReduction > 0 ? 'text-emerald-400' : 'text-zinc-400'}`}>
+                        {formatBytes(previewSize)}
+                      </span>
+                      {previewReduction > 0 && (
+                        <span className="text-[10px] font-bold text-emerald-400 bg-emerald-950/60 border border-emerald-800/40 rounded-full px-1.5 py-0.5">
+                          -{previewReduction}%
+                        </span>
+                      )}
+                    </div>
+                  )}
+                  {isPreviewLoading && (
+                    <div className="w-3.5 h-3.5 border-2 border-violet-600 border-t-transparent rounded-full animate-spin" />
+                  )}
+                </div>
+                <div
+                  className="h-52 sm:h-64 flex items-center justify-center p-3 relative"
+                  style={{ background: 'repeating-conic-gradient(#18181b 0% 25%, #111113 0% 50%) 0 0 / 16px 16px' }}
+                >
+                  {previewUrl && (
+                    // eslint-disable-next-line @next/next/no-img-element
+                    <img
+                      src={previewUrl}
+                      alt="Compressed preview"
+                      className={`max-h-full max-w-full object-contain rounded drop-shadow-lg transition-opacity duration-150 ${
+                        isPreviewLoading ? 'opacity-40' : 'opacity-100'
+                      }`}
+                    />
+                  )}
+                  {!previewUrl && isPreviewLoading && (
+                    <div className="flex flex-col items-center gap-2 text-zinc-600">
+                      <div className="w-8 h-8 border-2 border-violet-600 border-t-transparent rounded-full animate-spin" />
+                      <span className="text-xs">Generating preview...</span>
+                    </div>
+                  )}
+                </div>
+              </div>
+            </div>
+
+            {/* Summary bar */}
+            {previewSize !== null && (
+              <div className={`mt-3 rounded-2xl border px-5 py-3.5 flex items-center justify-between ${
+                previewReduction > 0
+                  ? 'bg-emerald-950/30 border-emerald-800/30'
+                  : 'bg-zinc-900 border-zinc-800'
+              }`}>
+                <div className="flex items-center gap-2">
+                  {isPng ? (
+                    <svg className="w-4 h-4 text-zinc-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M11.25 11.25l.041-.02a.75.75 0 011.063.852l-.708 2.836a.75.75 0 001.063.853l.041-.021M21 12a9 9 0 11-18 0 9 9 0 0118 0zm-9-3.75h.008v.008H12V8.25z" />
+                    </svg>
+                  ) : (
+                    <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
+                  )}
+                  <span className="text-sm text-zinc-400">
+                    {isPng
+                      ? 'PNG is lossless — visual quality is unchanged. File size depends on content.'
+                      : (
+                        <>
+                          Estimated{' '}
+                          <span className="font-semibold text-emerald-400">{formatBytes(file.size - previewSize)}</span>
+                          {' '}saved —{' '}
+                          <span className="font-semibold text-emerald-400">{previewReduction}% smaller</span>
+                        </>
+                      )
+                    }
+                  </span>
+                </div>
+                {!isPng && (
+                  <span className="text-[11px] text-zinc-600 bg-zinc-800 rounded-full px-2.5 py-1">
+                    client estimate
+                  </span>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+
         {/* ---- Settings ---- */}
         {file && (
           <div className="bg-zinc-900 border border-zinc-800 rounded-3xl p-6 mb-5">
@@ -381,27 +596,31 @@ export default function CompressorApp() {
                 {/* Quality Slider */}
                 <div>
                   <div className="flex justify-between items-center mb-3">
-                    <label className="text-zinc-400 text-sm">Quality</label>
+                    <label className="text-zinc-400 text-sm">
+                      {isPng ? 'Compression Level' : 'Quality'}
+                    </label>
                     <div className="flex items-center gap-2">
-                      <span className="text-[11px] font-medium text-violet-400/70 bg-violet-950/60 border border-violet-800/40 rounded-full px-2 py-0.5">
-                        {qualityLabel}
-                      </span>
+                      {!isPng && (
+                        <span className="text-[11px] font-medium text-violet-400/70 bg-violet-950/60 border border-violet-800/40 rounded-full px-2 py-0.5">
+                          {qualityLabel}
+                        </span>
+                      )}
                       <span className="text-violet-400 font-mono text-sm font-bold w-10 text-right">{quality}%</span>
                     </div>
                   </div>
-                  <div className="relative">
-                    <input
-                      type="range"
-                      min="1"
-                      max="100"
-                      value={quality}
-                      onChange={(e) => setQuality(parseInt(e.target.value))}
-                      className="w-full h-2 rounded-full appearance-none cursor-pointer accent-violet-600 bg-zinc-800"
-                    />
-                  </div>
+                  <input
+                    type="range"
+                    min="1"
+                    max="100"
+                    value={quality}
+                    onChange={(e) => setQuality(parseInt(e.target.value))}
+                    className="w-full h-2 rounded-full appearance-none cursor-pointer"
+                  />
                   <div className="flex justify-between text-[11px] text-zinc-600 mt-2">
-                    <span>Smaller file</span>
-                    <span>Better quality</span>
+                    {isPng
+                      ? <><span>Faster encode</span><span>Smaller file</span></>
+                      : <><span>Smaller file</span><span>Better quality</span></>
+                    }
                   </div>
                 </div>
 
@@ -425,7 +644,7 @@ export default function CompressorApp() {
                   </div>
                   {imageFormat !== 'keep' && (
                     <p className="text-zinc-600 text-xs mt-2">
-                      File will be converted to <span className="text-zinc-400 font-medium">.{imageFormat === 'jpeg' ? 'jpg' : imageFormat}</span>
+                      Output: <span className="text-zinc-400 font-medium">.{imageFormat === 'jpeg' ? 'jpg' : imageFormat}</span>
                     </p>
                   )}
                 </div>
@@ -475,7 +694,7 @@ export default function CompressorApp() {
                 <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
                   <path strokeLinecap="round" strokeLinejoin="round" d="M9 9V4.5M9 9H4.5M9 9L3.75 3.75M9 15v4.5M9 15H4.5M9 15l-5.25 5.25M15 9h4.5M15 9V4.5M15 9l5.25-5.25M15 15h4.5M15 15v4.5m0-4.5l5.25 5.25" />
                 </svg>
-                Compress Now
+                Compress & Download
               </>
             )}
           </button>
@@ -484,7 +703,6 @@ export default function CompressorApp() {
         {/* ---- Result Card ---- */}
         {result && (
           <div className="bg-zinc-900 border border-zinc-800 rounded-3xl overflow-hidden">
-            {/* Success header */}
             <div className="bg-gradient-to-r from-emerald-950/60 to-emerald-900/30 border-b border-emerald-800/30 px-6 py-4 flex items-center gap-3">
               <div className="w-8 h-8 rounded-xl bg-emerald-500/20 border border-emerald-500/40 flex items-center justify-center text-emerald-400">
                 <CheckIcon />
@@ -496,13 +714,12 @@ export default function CompressorApp() {
             </div>
 
             <div className="p-6">
-              {/* Stats grid */}
+              {/* Stats */}
               <div className="grid grid-cols-3 gap-3 mb-6">
                 <div className="bg-zinc-800/50 rounded-2xl p-4 text-center border border-zinc-700/30">
                   <p className="text-zinc-500 text-xs mb-1.5 font-medium">Original</p>
                   <p className="text-zinc-200 font-bold text-lg">{formatBytes(result.originalSize)}</p>
                 </div>
-
                 <div className="flex items-center justify-center">
                   <div className="text-center">
                     <div className={`text-3xl font-black tracking-tighter ${
@@ -515,7 +732,6 @@ export default function CompressorApp() {
                     </div>
                   </div>
                 </div>
-
                 <div className="bg-zinc-800/50 rounded-2xl p-4 text-center border border-zinc-700/30">
                   <p className="text-zinc-500 text-xs mb-1.5 font-medium">Compressed</p>
                   <p className={`font-bold text-lg ${reduction > 0 ? 'text-emerald-400' : 'text-amber-400'}`}>
@@ -537,22 +753,14 @@ export default function CompressorApp() {
                 <div className="h-2.5 bg-zinc-800 rounded-full overflow-hidden">
                   <div
                     className={`h-full rounded-full transition-all duration-700 ${
-                      reduction > 0
-                        ? 'bg-gradient-to-r from-emerald-600 to-emerald-400'
-                        : 'bg-zinc-600'
+                      reduction > 0 ? 'bg-gradient-to-r from-emerald-600 to-emerald-400' : 'bg-zinc-600'
                     }`}
-                    style={{
-                      width: `${Math.max(2, 100 - (result.compressedSize / result.originalSize) * 100)}%`
-                    }}
+                    style={{ width: `${Math.max(2, 100 - (result.compressedSize / result.originalSize) * 100)}%` }}
                   />
-                </div>
-                <div className="flex justify-between text-[11px] text-zinc-700 mt-1.5">
-                  <span>0%</span>
-                  <span>100%</span>
                 </div>
               </div>
 
-              {/* Download button */}
+              {/* Download */}
               <button
                 onClick={handleDownload}
                 className="w-full py-4 bg-emerald-600 hover:bg-emerald-500 text-white font-bold rounded-2xl transition-colors flex items-center justify-center gap-2.5 text-base"
@@ -561,7 +769,6 @@ export default function CompressorApp() {
                 Download {result.filename}
               </button>
 
-              {/* Compress another */}
               <button
                 onClick={resetState}
                 className="w-full mt-3 py-3 text-zinc-500 hover:text-zinc-300 text-sm font-medium transition-colors"
@@ -577,7 +784,7 @@ export default function CompressorApp() {
       <footer className="border-t border-zinc-800/60 py-6 mt-4">
         <div className="mx-auto max-w-3xl px-5 flex flex-col sm:flex-row items-center justify-between gap-2 text-xs text-zinc-600">
           <span>FileCompressor — All processing done locally on your machine</span>
-          <span>Images &amp; PDFs · Up to 50MB</span>
+          <span>Images &amp; PDFs · Up to 4MB</span>
         </div>
       </footer>
     </div>
